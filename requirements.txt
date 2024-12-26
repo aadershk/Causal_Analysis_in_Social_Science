@@ -1,0 +1,23 @@
+# PDF extraction
+PyMuPDF==1.22.2
+
+# NLP libraries
+spacy==3.5.3
+wordninja==2.0.0
+langdetect==1.0.9
+
+# Pytorch + Transformers for classification
+# torch==2.0.1
+# if you have pytorch installed with a specific cuda version in your virtual env, then let the above line stay commented
+transformers==4.30.2
+tokenizers==0.13.3
+
+# seqeval for token-level precision/recall/f1
+seqeval==1.2.2
+
+# requests for file downloads
+requests==2.31.0
+
+# After installing, run:
+#   python -m spacy download en_core_web_sm
+# to get the language model used by spaCy.
