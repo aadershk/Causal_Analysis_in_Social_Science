@@ -4,7 +4,7 @@ import json
 import re
 from typing import List, Dict, Any
 from random import sample
-from seqeval.metrics import precision_score, recall_score, f1_score, classification_report
+from seqeval.metrics import precision_score, recall_score, f1_score, classification_report, accuracy_score
 from transformers import AutoTokenizer, AutoModelForTokenClassification, pipeline
 
 ##############################################################################
@@ -140,7 +140,7 @@ class ArgBasedCausalIndicatorEvaluator(BaseCausalIndicatorEvaluator):
 
         def strip_tags(tok: str) -> str:
             tok_clean = re.sub(r"</?ARG[01]>", "", tok)
-            tok_clean = re.sub(r"</?SIG\d*>", "", tok_clean)
+            tok_clean = re.sub(r"</?SIG\d*>", "", tok)
             return tok_clean.strip()
 
         cleaned_tokens = []
@@ -278,6 +278,7 @@ def main():
     print(f"Precision: {precision_score(arg_gold_seq, arg_pred_seq):.4f}")
     print(f"Recall:    {recall_score(arg_gold_seq, arg_pred_seq):.4f}")
     print(f"F1 Score:  {f1_score(arg_gold_seq, arg_pred_seq):.4f}")
+    print(f"Accuracy:  {accuracy_score(arg_gold_seq, arg_pred_seq):.4f}")
 
     print("\n===== SOCIAL SCIENCE EVALUATION =====")
     social_evaluator = SocialScienceCausalIndicatorEvaluator()
@@ -300,6 +301,7 @@ def main():
     print(f"Precision: {precision_score(social_gold_seq, social_pred_seq):.4f}")
     print(f"Recall:    {recall_score(social_gold_seq, social_pred_seq):.4f}")
     print(f"F1 Score:  {f1_score(social_gold_seq, social_pred_seq):.4f}")
+    print(f"Accuracy:  {accuracy_score(social_gold_seq, social_pred_seq):.4f}")
 
 
 if __name__ == "__main__":

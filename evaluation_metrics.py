@@ -1,9 +1,12 @@
+# Code Cell 1: evaluation_metrics.py
 import os
 import csv
 import json
 import re
 from typing import List, Dict, Any
-from seqeval.metrics import precision_score, recall_score, f1_score, classification_report
+from seqeval.metrics import precision_score, recall_score, f1_score, accuracy_score, classification_report
+from sklearn.metrics import confusion_matrix
+import numpy as np
 from transformers import AutoTokenizer, AutoModelForTokenClassification, pipeline
 
 ##############################################################################
@@ -104,7 +107,7 @@ class ArgBasedEvaluator(BaseEvaluator):
     """
     Evaluator for ARG-based CSV dataset.
     """
-    GENERAL_DATA_FILE = r"C:\Users\aader\PycharmProjects\Causal_Analysis_in_Social_Science\data (annotated)\general_data.csv"
+    GENERAL_DATA_FILE = r"C:\\Users\\aader\\PycharmProjects\\Causal_Analysis_in_Social_Science\\data (annotated)\\general_data.csv"
 
     def read_data_file(self) -> List[dict]:
         if not os.path.exists(self.GENERAL_DATA_FILE):
@@ -147,7 +150,7 @@ class ArgBasedEvaluator(BaseEvaluator):
 
         def strip_tags(tok: str) -> str:
             tok_clean = re.sub(r"</?ARG[01]>", "", tok)
-            tok_clean = re.sub(r"</?SIG\d*>", "", tok_clean)
+            tok_clean = re.sub(r"</?SIG\d*>", "", tok)
             return tok_clean.strip()
 
         cleaned_tokens = []
@@ -189,8 +192,8 @@ class SocialScienceEvaluator(BaseEvaluator):
     Evaluator for Social Science JSONL dataset.
     """
     JSON_FILES = [
-        r"C:\Users\aader\PycharmProjects\Causal_Analysis_in_Social_Science\data (annotated)\social_data_1.jsonl",
-        r"C:\Users\aader\PycharmProjects\Causal_Analysis_in_Social_Science\data (annotated)\social_data_2.jsonl",
+        r"C:\\Users\\aader\\PycharmProjects\\Causal_Analysis_in_Social_Science\\data (annotated)\\social_data_1.jsonl",
+        r"C:\\Users\\aader\\PycharmProjects\\Causal_Analysis_in_Social_Science\\data (annotated)\\social_data_2.jsonl",
     ]
 
     def read_json_files(self) -> List[Dict[str, Any]]:
@@ -258,6 +261,12 @@ class SocialScienceEvaluator(BaseEvaluator):
 # MAIN
 ##############################################################################
 
+def compute_confusion_matrix(gold, pred):
+    flat_gold = [item for sublist in gold for item in sublist]
+    flat_pred = [item for sublist in pred for item in sublist]
+    matrix = confusion_matrix(flat_gold, flat_pred, labels=["O", "C", "E"])
+    return matrix
+
 def main():
     print("\n===== ARG-BASED EVALUATION =====")
     arg_evaluator = ArgBasedEvaluator()
@@ -276,9 +285,14 @@ def main():
         gold_seq.append([arg_evaluator.unify_label(g) for g in gold_labels[:L]])
         pred_seq.append([arg_evaluator.unify_label(p) for p in pred_labels[:L]])
 
+    print(f"Accuracy:  {accuracy_score(gold_seq, pred_seq):.4f}")
     print(f"Precision: {precision_score(gold_seq, pred_seq):.4f}")
     print(f"Recall:    {recall_score(gold_seq, pred_seq):.4f}")
     print(f"F1 Score:  {f1_score(gold_seq, pred_seq):.4f}")
+
+    matrix = compute_confusion_matrix(gold_seq, pred_seq)
+    print("Confusion Matrix (ARG-Based):")
+    print(matrix)
 
     print("\n===== SOCIAL SCIENCE EVALUATION =====")
     social_evaluator = SocialScienceEvaluator()
@@ -297,10 +311,14 @@ def main():
         gold_seq.append([social_evaluator.unify_label(g) for g in gold_labels[:L]])
         pred_seq.append([social_evaluator.unify_label(p) for p in pred_labels[:L]])
 
+    print(f"Accuracy:  {accuracy_score(gold_seq, pred_seq):.4f}")
     print(f"Precision: {precision_score(gold_seq, pred_seq):.4f}")
     print(f"Recall:    {recall_score(gold_seq, pred_seq):.4f}")
     print(f"F1 Score:  {f1_score(gold_seq, pred_seq):.4f}")
 
+    matrix = compute_confusion_matrix(gold_seq, pred_seq)
+    print("Confusion Matrix (Social Science):")
+    print(matrix)
 
 if __name__ == "__main__":
     main()
