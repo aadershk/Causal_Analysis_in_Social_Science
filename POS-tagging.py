@@ -3,50 +3,44 @@ import csv
 import json
 import re
 import random
-from typing import List, Dict, Any
+import warnings
+from typing import List, Dict, Any, Tuple
 from collections import Counter, defaultdict
 
-from tqdm import tqdm
 import spacy
+from tqdm import tqdm
 from prefixspan import PrefixSpan
-import warnings
-
-from seqeval.metrics import precision_score, recall_score, f1_score, classification_report
-from transformers import AutoTokenizer, AutoModelForTokenClassification, pipeline
+from seqeval.metrics import (
+    precision_score,
+    recall_score,
+    f1_score,
+    classification_report
+)
+from transformers import (
+    AutoTokenizer,
+    AutoModelForTokenClassification,
+    pipeline
+)
 
 warnings.filterwarnings("ignore", category=UserWarning)
 
-##############################################################################
-#                         HELPER FUNCTIONS                                  #
-##############################################################################
 
-def strip_tags(tok: str) -> str:
-    """
-    Remove <ARGx> and <SIGx> tags from a token.
-    """
-    tok_clean = re.sub(r"</?ARG[01]>", "", tok)
-    tok_clean = re.sub(r"</?SIG\d*>", "", tok_clean)
-    return tok_clean.strip()
+def strip_tags(token: str) -> str:
+    """Remove <ARGx> and <SIGx> tags from a token."""
+    token = re.sub(r"</?ARG[01]>", "", token)
+    token = re.sub(r"</?SIG\d*>", "", token)
+    return token.strip()
 
-def unify_label(lab: str) -> str:
-    """
-    Convert B-C/I-C => 'C', B-E/I-E => 'E', else 'O'.
-    """
-    if lab in ("B-C", "I-C"):
+def unify_label(label: str) -> str:
+    """Convert B-C/I-C => 'C', B-E/I-E => 'E', else 'O'."""
+    if label in ("B-C", "I-C"):
         return "C"
-    elif lab in ("B-E", "I-E"):
+    if label in ("B-E", "I-E"):
         return "E"
-    else:
-        return "O"
+    return "O"
 
 def map_pipeline_label_to_BIO(label_group: str) -> str:
-    """
-    Model's label mapping:
-       LABEL_0 -> B-C
-       LABEL_1 -> B-E
-       LABEL_2 -> I-C
-       LABEL_3 -> I-E
-    """
+    """Map pipeline label groups to BIO-style tags."""
     mapping = {
         "LABEL_0": "B-C",
         "LABEL_1": "B-E",
@@ -55,98 +49,75 @@ def map_pipeline_label_to_BIO(label_group: str) -> str:
     }
     return mapping.get(label_group, "O")
 
-def build_char_label_array(text: str, preds, label_group_mapping) -> List[str]:
-    """
-    Create a char-level label array, init 'O'. Fill with 'C' or 'E' for cause/effect spans.
-    """
-    char_labels = ["O"] * len(text)
-    for pr in preds:
-        grp = pr["entity_group"]
-        mapped_bio = label_group_mapping(grp)
-        s_i, e_i = pr["start"], pr["end"]
-        if s_i < 0 or e_i > len(text):
-            continue
-        if mapped_bio in ("B-C", "I-C"):
-            for c_idx in range(s_i, e_i):
-                if 0 <= c_idx < len(char_labels):
-                    char_labels[c_idx] = "C"
-        elif mapped_bio in ("B-E", "I-E"):
-            for c_idx in range(s_i, e_i):
-                if 0 <= c_idx < len(char_labels):
-                    char_labels[c_idx] = "E"
-    return char_labels
+def build_char_label_array(text: str, predictions, label_mapping) -> List[str]:
+    """Create a char-level label array; fill with 'C' or 'E' for cause/effect spans."""
+    char_arr = ["O"] * len(text)
+    for pr in predictions:
+        group = pr["entity_group"]
+        mapped_bio = label_mapping(group)
+        start, end = pr["start"], pr["end"]
+        if 0 <= start < end <= len(text):
+            if mapped_bio in ("B-C", "I-C"):
+                for idx in range(start, end):
+                    char_arr[idx] = "C"
+            elif mapped_bio in ("B-E", "I-E"):
+                for idx in range(start, end):
+                    char_arr[idx] = "E"
+    return char_arr
 
 def predict_labels_on_tokens(pipe, tokens: List[str]) -> List[str]:
-    """
-    Predict token-level cause/effect labels using HF pipeline output, returning C/E/O labels.
-    """
-    joined_text = " ".join(tokens)
-    preds = pipe(joined_text)
-    char_labels = build_char_label_array(joined_text, preds, map_pipeline_label_to_BIO)
+    """Predict token-level cause/effect labels using Hugging Face pipeline."""
+    text = " ".join(tokens)
+    predictions = pipe(text)
+    char_labels = build_char_label_array(text, predictions, map_pipeline_label_to_BIO)
 
-    # Map back to tokens (B-C, I-C, B-E, I-E)
-    pred_bio_labels = []
-    char_ptr = 0
+    pred_bio = []
+    pointer = 0
     for tok in tokens:
-        seg = char_labels[char_ptr : char_ptr + len(tok)]
-        if all(x == "O" for x in seg):
-            pred_bio_labels.append("O")
+        seg = char_labels[pointer:pointer + len(tok)]
+        if all(lbl == "O" for lbl in seg):
+            pred_bio.append("O")
         else:
             if "C" in seg:
-                if seg[0] == "C":
-                    pred_bio_labels.append("B-C")
-                else:
-                    pred_bio_labels.append("I-C")
+                pred_bio.append("B-C" if seg[0] == "C" else "I-C")
             elif "E" in seg:
-                if seg[0] == "E":
-                    pred_bio_labels.append("B-E")
-                else:
-                    pred_bio_labels.append("I-E")
+                pred_bio.append("B-E" if seg[0] == "E" else "I-E")
             else:
-                pred_bio_labels.append("O")
-        char_ptr += len(tok) + 1  # +1 for space
+                pred_bio.append("O")
+        pointer += len(tok) + 1
 
-    # unify
-    pred_unified = [unify_label(x) for x in pred_bio_labels]
-    return pred_unified
+    return [unify_label(lbl) for lbl in pred_bio]
 
 def align_spacy_with_tokens(raw_text: str, token_list: List[str], nlp):
-    """
-    Attempt to align each 'token' with spaCy's POS. If spaCy splits differently, fallback is 'X'.
-    """
+    """Align each token with spaCy's POS. If mismatch, fallback is 'X'."""
     doc = nlp(raw_text)
     pos_map = defaultdict(list)
-    # Collect each doc token text->pos in a list to handle duplicates
-    # e.g. if doc has 'the' multiple times
-    for t in doc:
-        pos_map[t.text].append(t.pos_)
+    for token in doc:
+        pos_map[token.text].append(token.pos_)
 
     aligned = []
     for tok in token_list:
         if pos_map[tok]:
-            aligned.append((tok, pos_map[tok].pop(0)))  # take the first available pos
+            aligned.append((tok, pos_map[tok].pop(0)))
         else:
             aligned.append((tok, "X"))
     return aligned
 
-##############################################################################
-#                        MAIN ANALYSIS CLASS                                #
-##############################################################################
 
 class TokenLevelErrorAnalysis:
     """
-    Token-level cause/effect error analysis.
-    Now extended to:
-      - Also mine top POS-only sequences (besides (token, pos)).
-      - Output all tokens labeled pos='X' to a text file for manual inspection.
+    Analyzes token-level cause/effect errors, mines POS-based patterns,
+    and stores tokens labeled as 'X' for manual review.
     """
 
-    def __init__(self,
-                 general_csv_path: str,
-                 social_jsonl_paths: List[str],
-                 model_name: str = "tanfiona/unicausal-tok-baseline",
-                 output_dir: str = "analysis_outputs",
-                 random_seed: int = 42):
+    def __init__(
+        self,
+        general_csv_path: str,
+        social_jsonl_paths: List[str],
+        model_name: str = "tanfiona/unicausal-tok-baseline",
+        output_dir: str = "analysis_outputs",
+        random_seed: int = 42
+    ):
         self.general_csv_path = general_csv_path
         self.social_jsonl_paths = social_jsonl_paths
         self.model_name = model_name
@@ -154,19 +125,15 @@ class TokenLevelErrorAnalysis:
         self.random_seed = random_seed
 
         random.seed(self.random_seed)
+        self.all_data = []
 
-        self.all_data = []  # final token-level data
-
-        # We store subsets for correct vs. incorrect tokens
+        # Subset storages
         self.correct_tokens_general = []
         self.incorrect_tokens_general = []
         self.correct_tokens_social = []
         self.incorrect_tokens_social = []
+        self.x_tokens = []
 
-        # We'll store tokens that have pos='X'
-        self.x_tokens = []  # a list of tuples: (token_text, domain, correctness_flag, context?)
-
-        # spaCy + HF pipeline
         self.nlp = None
         self.pipe = None
         self._init_spacy()
@@ -175,19 +142,16 @@ class TokenLevelErrorAnalysis:
         if not os.path.exists(self.output_dir):
             os.makedirs(self.output_dir)
 
-    ###########################################################################
-    # INITIALIZATION
-    ###########################################################################
-    def _init_spacy(self):
+    def _init_spacy(self) -> None:
         print("[INFO] Loading spaCy (en_core_web_sm)...")
         self.nlp = spacy.load("en_core_web_sm")
         try:
             self.nlp.to_gpu()
-            print("[INFO] spaCy to_gpu successful (if GPU available).")
+            print("[INFO] spaCy on GPU.")
         except Exception:
             print("[INFO] spaCy on CPU.")
 
-    def _init_pipeline(self):
+    def _init_pipeline(self) -> None:
         print(f"[INFO] Loading HF pipeline from model: {self.model_name}")
         tokenizer = AutoTokenizer.from_pretrained(self.model_name)
         model = AutoModelForTokenClassification.from_pretrained(self.model_name)
@@ -199,19 +163,16 @@ class TokenLevelErrorAnalysis:
             device=0  # or -1 for CPU
         )
 
-    ###########################################################################
-    # GOLD LABEL BUILDING (GENERAL)
-    ###########################################################################
     def load_general_data(self) -> List[Dict[str, Any]]:
         if not os.path.exists(self.general_csv_path):
             raise FileNotFoundError(f"General CSV not found: {self.general_csv_path}")
 
         data = []
-        with open(self.general_csv_path, "r", encoding="utf-8-sig") as f:
-            reader = csv.DictReader(f)
+        with open(self.general_csv_path, "r", encoding="utf-8-sig") as fin:
+            reader = csv.DictReader(fin)
             fields = reader.fieldnames
             if not fields:
-                raise ValueError("No columns in general CSV.")
+                raise ValueError("No columns in the CSV.")
             required = {"text", "text_w_pairs"}
             missing = required - set(fields)
             if missing:
@@ -219,26 +180,24 @@ class TokenLevelErrorAnalysis:
 
             for row in reader:
                 raw_text = row["text"]
-                text_w_pairs = row["text_w_pairs"]
-                if not raw_text or not text_w_pairs:
+                pairs_text = row["text_w_pairs"]
+                if not raw_text or not pairs_text:
                     continue
-                # Must have <ARG0> or <ARG1>
-                if ("<ARG0>" not in text_w_pairs) and ("<ARG1>" not in text_w_pairs):
+                if ("<ARG0>" not in pairs_text) and ("<ARG1>" not in pairs_text):
                     continue
-                tokens, gold_bio = self._build_gold_labels_general(raw_text, text_w_pairs)
-                gold_unified = [unify_label(x) for x in gold_bio]
+                tokens, gold_bio = self._build_gold_labels_general(raw_text, pairs_text)
+                unified = [unify_label(x) for x in gold_bio]
                 data.append({
                     "domain": "general",
                     "text": raw_text,
                     "tokens": tokens,
-                    "gold_labels": gold_unified
+                    "gold_labels": unified
                 })
         return data
 
-    def _build_gold_labels_general(self, raw_text: str, text_w_pairs: str):
+    def _build_gold_labels_general(self, raw_text: str, text_w_pairs: str) -> Tuple[List[str], List[str]]:
         raw_tokens = raw_text.split()
         pair_tokens = text_w_pairs.split()
-
         gold_labels = []
         label_state = "O"
         cleaned_tokens = []
@@ -248,114 +207,96 @@ class TokenLevelErrorAnalysis:
             if "<ARG0>" in p_tok:
                 local_label = "B-C"
                 label_state = "I-C"
-            elif "</ARG0>" in p_tok:
-                if label_state in ("I-C", "B-C"):
-                    local_label = "I-C"
+            elif "</ARG0>" in p_tok and label_state in ("I-C", "B-C"):
+                local_label = "I-C"
                 label_state = "O"
             elif "<ARG1>" in p_tok:
                 local_label = "B-E"
                 label_state = "I-E"
-            elif "</ARG1>" in p_tok:
-                if label_state in ("I-E", "B-E"):
-                    local_label = "I-E"
+            elif "</ARG1>" in p_tok and label_state in ("I-E", "B-E"):
+                local_label = "I-E"
                 label_state = "O"
 
-            ctok = strip_tags(p_tok)
-            if not ctok:
-                continue
-            cleaned_tokens.append(ctok)
-            gold_labels.append(local_label)
+            cleaned = strip_tags(p_tok)
+            if cleaned:
+                cleaned_tokens.append(cleaned)
+                gold_labels.append(local_label)
 
-        L = min(len(raw_tokens), len(cleaned_tokens))
-        tokens = raw_tokens[:L]
-        labs = gold_labels[:L]
-        return tokens, labs
+        limit = min(len(raw_tokens), len(cleaned_tokens))
+        return raw_tokens[:limit], gold_labels[:limit]
 
-    ###########################################################################
-    # GOLD LABEL BUILDING (SOCIAL)
-    ###########################################################################
     def load_social_data(self) -> List[Dict[str, Any]]:
         data = []
         for path in self.social_jsonl_paths:
             if not os.path.exists(path):
-                print(f"[WARNING] Social file not found: {path}")
+                print(f"[WARNING] File not found: {path}")
                 continue
-            with open(path, "r", encoding="utf-8") as f:
-                for line in f:
+            with open(path, "r", encoding="utf-8") as fin:
+                for line in fin:
                     obj = json.loads(line.strip())
                     text = obj["text"]
                     entities = obj.get("entities", [])
-                    ce_entities = [e for e in entities if e["label"].lower() in ["cause", "effect"]]
-                    if not ce_entities:
+                    ce_ents = [e for e in entities if e["label"].lower() in ["cause", "effect"]]
+                    if not ce_ents:
                         continue
-                    tokens, gold_bio = self._build_gold_labels_social(text, ce_entities)
-                    gold_unified = [unify_label(x) for x in gold_bio]
+                    tokens, gold_bio = self._build_gold_labels_social(text, ce_ents)
+                    unified = [unify_label(x) for x in gold_bio]
                     data.append({
                         "domain": "social",
                         "text": text,
                         "tokens": tokens,
-                        "gold_labels": gold_unified
+                        "gold_labels": unified
                     })
         return data
 
-    def _build_gold_labels_social(self, text: str, entities: List[Dict[str, Any]]):
-        raw_tokens = text.split()
-        # build char positions
-        char_positions = []
+    def _build_gold_labels_social(self, text: str, entities: List[Dict[str, Any]]) -> Tuple[List[str], List[str]]:
+        tokens = text.split()
+        char_map = []
         idx = 0
-        for rt in raw_tokens:
-            start_i = idx
-            end_i = idx + len(rt)
-            char_positions.append((start_i, end_i))
+        for tok in tokens:
+            start_i, end_i = idx, idx + len(tok)
+            char_map.append((start_i, end_i))
             idx = end_i + 1
 
-        labels = ["O"] * len(raw_tokens)
+        labels = ["O"] * len(tokens)
+        cause_spans, effect_spans = [], []
 
-        cause_spans = []
-        effect_spans = []
-        for e in entities:
-            lb = e["label"].lower()
-            st = e["start_offset"]
-            en = e["end_offset"]
+        for ent in entities:
+            lb = ent["label"].lower()
+            st, en = ent["start_offset"], ent["end_offset"]
             if lb == "cause":
                 cause_spans.append((st, en))
             elif lb == "effect":
                 effect_spans.append((st, en))
 
-        def label_span(span_list, B_tag, I_tag):
+        def label_span(span_list, b_tag, i_tag):
             in_span = False
-            for (st, en) in span_list:
-                for i, (cst, cen) in enumerate(char_positions):
-                    if cen > st and cst < en:  # overlap
+            for st, en in span_list:
+                for i, (cstart, cend) in enumerate(char_map):
+                    if cend > st and cstart < en:
                         if not in_span:
-                            labels[i] = B_tag
+                            labels[i] = b_tag
                             in_span = True
                         else:
-                            if labels[i] == "O" or labels[i].startswith("B-"):
-                                labels[i] = I_tag
-                    else:
-                        if cst >= en:
-                            in_span = False
+                            if labels[i] in ("O", b_tag):
+                                labels[i] = i_tag
+                    elif cstart >= en:
+                        in_span = False
 
         label_span(cause_spans, "B-C", "I-C")
         label_span(effect_spans, "B-E", "I-E")
+        return tokens, labels
 
-        return raw_tokens, labels
-
-    ###########################################################################
-    # MAIN RUN
-    ###########################################################################
-    def run_analysis(self, sample_size=60):
-        # 1) Load general + social
+    def run_analysis(self, sample_size: int = 60) -> None:
         general_data = self.load_general_data()
         social_data = self.load_social_data()
         combined = general_data + social_data
 
-        # 2) sample
         gen_items = [x for x in combined if x["domain"] == "general"]
         soc_items = [x for x in combined if x["domain"] == "social"]
         random.shuffle(gen_items)
         random.shuffle(soc_items)
+
         if len(gen_items) > sample_size:
             gen_items = gen_items[:sample_size]
         if len(soc_items) > sample_size:
@@ -363,14 +304,11 @@ class TokenLevelErrorAnalysis:
         final_data = gen_items + soc_items
         random.shuffle(final_data)
 
-        # 3) Predict
         for item in tqdm(final_data, desc="Model inference"):
-            pred_unified = predict_labels_on_tokens(self.pipe, item["tokens"])
-            item["pred_labels"] = pred_unified
+            pred_labels = predict_labels_on_tokens(self.pipe, item["tokens"])
+            item["pred_labels"] = pred_labels
 
-        # 4) Evaluate (seqeval)
-        gold_sequences = []
-        pred_sequences = []
+        gold_sequences, pred_sequences = [], []
         for item in final_data:
             gold_sequences.append(item["gold_labels"])
             pred_sequences.append(item["pred_labels"])
@@ -386,7 +324,6 @@ class TokenLevelErrorAnalysis:
         print("[DETAIL REPORT]")
         print(classification_report(gold_sequences, pred_sequences))
 
-        # 5) Align spaCy POS + Mark correct/incorrect
         self.all_data = []
         for item in final_data:
             domain = item["domain"]
@@ -394,8 +331,6 @@ class TokenLevelErrorAnalysis:
             toks = item["tokens"]
             golds = item["gold_labels"]
             preds = item["pred_labels"]
-
-            # Align pos
             pos_aligned = align_spacy_with_tokens(text, toks, self.nlp)
 
             record = {
@@ -407,67 +342,49 @@ class TokenLevelErrorAnalysis:
                 "pred_labels": [],
                 "correct_flags": []
             }
-            for i, tok in enumerate(toks):
+            for i, token in enumerate(toks):
                 g = golds[i]
                 p = preds[i]
-                cflag = (g == p)
-                # If spaCy split mismatch, fallback is 'X'
+                correct_flag = (g == p)
                 assigned_pos = pos_aligned[i][1] if i < len(pos_aligned) else "X"
-                record["tokens"].append(tok)
+
+                record["tokens"].append(token)
                 record["pos_tags"].append(assigned_pos)
                 record["gold_labels"].append(g)
                 record["pred_labels"].append(p)
-                record["correct_flags"].append(cflag)
+                record["correct_flags"].append(correct_flag)
+
             self.all_data.append(record)
 
-        # 6) Final error analysis
         self.final_error_analysis()
 
-    ###########################################################################
-    # ERROR ANALYSIS
-    ###########################################################################
-    def final_error_analysis(self):
+    def final_error_analysis(self) -> None:
         """
-        - Create 4 subsets: general-correct, general-incorrect, social-correct, social-incorrect
-        - For each subset, we do:
-          (1) prefixspan on (token, pos)
-          (2) prefixspan on POS-only sequences
-        - Collect all pos='X' tokens in a separate list, then write them to x_tokens.txt
+        Splits data into correct/incorrect subsets for each domain,
+        runs prefixspan on tokens & POS sequences, saves X-labeled tokens.
         """
-        # Subsets as lists of lists (one list per sentence):
-        gc_tokpos = []
-        gi_tokpos = []
-        sc_tokpos = []
-        si_tokpos = []
-
-        # Also build parallel POS-only sequences
-        gc_posonly = []
-        gi_posonly = []
-        sc_posonly = []
-        si_posonly = []
-
-        # We'll gather all X tokens for post-run
+        gc_tokpos, gi_tokpos = [], []
+        sc_tokpos, si_tokpos = [], []
+        gc_posonly, gi_posonly = [], []
+        sc_posonly, si_posonly = [], []
         self.x_tokens = []
 
-        for record in self.all_data:
-            domain = record["domain"]
-            tokens = record["tokens"]
-            poss = record["pos_tags"]
-            cflags = record["correct_flags"]
+        for rec in self.all_data:
+            domain = rec["domain"]
+            tokens = rec["tokens"]
+            pos_tags = rec["pos_tags"]
+            correct_flags = rec["correct_flags"]
+            golds = rec["gold_labels"]
+            preds = rec["pred_labels"]
 
-            correct_seq = []
-            incorrect_seq = []
-            correct_pos_seq = []
-            incorrect_pos_seq = []
+            correct_seq, incorrect_seq = [], []
+            correct_pos_seq, incorrect_pos_seq = [], []
 
-            for i, (tok, pos, cflag) in enumerate(zip(tokens, poss, cflags)):
-                if pos == "SPACE" or pos == "PUNCT":
+            for tok, pos, cflag in zip(tokens, pos_tags, correct_flags):
+                if pos in ("SPACE", "PUNCT"):
                     continue
-
-                # Capture X tokens for debugging
                 if pos == "X":
-                    # store (token, domain, correctness) in a list
-                    self.x_tokens.append((tok, domain, cflag, record["text"]))
+                    self.x_tokens.append((tok, domain, cflag, rec["text"]))
 
                 if cflag:
                     correct_seq.append((tok, pos))
@@ -487,14 +404,12 @@ class TokenLevelErrorAnalysis:
                 sc_posonly.append(correct_pos_seq)
                 si_posonly.append(incorrect_pos_seq)
 
-        # Print distributions or run prefixspan on them
         print("\n==================== TOKEN-LEVEL ERROR ANALYSIS ====================")
 
-        # Quick POS distribution function
-        def compute_pos_dist(list_of_sequences):
+        def compute_pos_dist(list_of_seqs):
             cnt = Counter()
-            for seq in list_of_sequences:
-                for (_, pos) in seq:
+            for seq in list_of_seqs:
+                for _, pos in seq:
                     cnt[pos] += 1
             return cnt
 
@@ -514,7 +429,6 @@ class TokenLevelErrorAnalysis:
         print_top_pos("Social-Correct", sc_dist)
         print_top_pos("Social-Incorrect", si_dist)
 
-        # Now run prefixspan
         def run_prefixspan_and_print(label, sequences, topk=10):
             ps = PrefixSpan(sequences)
             patterns = ps.topk(topk, closed=True)
@@ -527,7 +441,6 @@ class TokenLevelErrorAnalysis:
         run_prefixspan_and_print("Social - Correct", sc_tokpos, 10)
         run_prefixspan_and_print("Social - Incorrect", si_tokpos, 10)
 
-        # POS-only prefixspan
         def run_prefixspan_pos_only(label, sequences, topk=10):
             ps = PrefixSpan(sequences)
             patterns = ps.topk(topk, closed=True)
@@ -540,48 +453,41 @@ class TokenLevelErrorAnalysis:
         run_prefixspan_pos_only("Social - Correct", sc_posonly, 10)
         run_prefixspan_pos_only("Social - Incorrect", si_posonly, 10)
 
-        # Finally, write out X tokens to a txt file
         x_outfile = os.path.join(self.output_dir, "x_tokens.txt")
-        with open(x_outfile, "w", encoding="utf-8") as f:
-            for x_tok, domain, cflag, full_text in self.x_tokens:
-                c_str = "CORRECT" if cflag else "INCORRECT"
-                f.write(f"Token='{x_tok}' Domain={domain} Correct={c_str}\n")
-                f.write(f"  Full sentence: {full_text}\n\n")
+        with open(x_outfile, "w", encoding="utf-8") as fout:
+            for tok, domain, cflag, full_text in self.x_tokens:
+                correctness = "CORRECT" if cflag else "INCORRECT"
+                fout.write(f"Token='{tok}' Domain={domain} Correct={correctness}\n")
+                fout.write(f"  Full sentence: {full_text}\n\n")
 
         print(f"\n[INFO] Wrote {len(self.x_tokens)} 'X' tokens to: {x_outfile}")
         print("==================== END OF ERROR ANALYSIS ====================")
 
 
-##############################################################################
-#                                MAIN                                        #
-##############################################################################
-
 if __name__ == "__main__":
     """
-    Example usage:
-     - Provide your general_data.csv with 'text' and 'text_w_pairs' columns.
-     - Provide a list of social_data.jsonl files with 'text' and 'entities' 
-       containing cause/effect spans.
-     - The script:
-       1) Builds token-level gold labels
-       2) Predicts with HF pipeline
-       3) Evaluates with seqeval
-       4) Splits correct vs. incorrect tokens 
-       5) Runs prefixspan on (token, pos) and POS-only sequences
-       6) Outputs all tokens assigned pos='X' to x_tokens.txt for manual inspection
+    1) Provide general_data.csv with 'text' and 'text_w_pairs' columns
+    2) Provide social_data.jsonl files with 'text' and 'entities'
+       containing cause/effect spans
+    3) The script:
+       - Builds token-level gold labels
+       - Predicts with HF pipeline
+       - Evaluates with seqeval
+       - Splits correct vs. incorrect tokens
+       - Runs prefixspan on (token, pos) & POS-only sequences
+       - Outputs tokens assigned pos='X' to x_tokens.txt for manual inspection
     """
-    # Adjust these paths as appropriate:
     GENERAL_CSV = r"data (annotated)/general_data.csv"
     SOCIAL_JSONL_PATHS = [
         r"data (annotated)/social_data_1.jsonl",
         r"data (annotated)/social_data_2.jsonl"
     ]
 
-    analysis = TokenLevelErrorAnalysis(
+    analyzer = TokenLevelErrorAnalysis(
         general_csv_path=GENERAL_CSV,
         social_jsonl_paths=SOCIAL_JSONL_PATHS,
         model_name="tanfiona/unicausal-tok-baseline",
         output_dir="analysis_outputs",
         random_seed=42
     )
-    analysis.run_analysis(sample_size=60)
+    analyzer.run_analysis(sample_size=60)

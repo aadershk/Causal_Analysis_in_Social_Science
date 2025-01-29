@@ -1,19 +1,15 @@
+import os
 import csv
 import json
-import openai
 import sys
 import time
 from typing import List, Tuple
 
-###############################################################################
-# 1) OPENAI API KEY
-###############################################################################
-# Mention the API key below
-#openai.api_key = ""
+import openai
 
-###############################################################################
-# 2) ANNOTATION GUIDELINES (VERBATIM)
-###############################################################################
+# Mention the API key below (kept commented for commit safety)
+# openai.api_key = ""
+
 ANNOTATION_GUIDELINES = r"""
 Annotation Guideline Structure for Causal Sentence Labeling
 1. Introduction
@@ -56,9 +52,6 @@ In the above sentence, the effect, “disutility”, has “positive” connecti
 • Always follow the definitions and guidelines!
 """
 
-###############################################################################
-# 3) SINGLE PROMPT FOR BATCH ANNOTATION
-###############################################################################
 BATCH_CALL_PROMPT = r"""
 You have two tasks for a list of sentences:
 
@@ -84,138 +77,116 @@ Return a JSON object with two keys:
 }
 """
 
-###############################################################################
-# 4) BUILD PROMPT FOR A BATCH
-###############################################################################
-def build_batch_prompt(sentences: List[str]) -> str:
-    """
-    Combines multiple sentences into a single prompt for batch processing.
-    """
-    sentences_text = "\n".join([f"- {s}" for s in sentences])
-    return f"{BATCH_CALL_PROMPT}\n\n{ANNOTATION_GUIDELINES}\nSentences:\n{sentences_text}"
+class OpenAIBatchAnnotator:
+    """Handles batch prompting, API calls, and response parsing for cause-effect annotation."""
 
-###############################################################################
-# 5) CALL OPENAI API (BATCH MODE)
-###############################################################################
-def call_openai_api(prompt: str, max_retries: int = 5) -> str:
-    """
-    Calls the OpenAI API. Retries on rate limit errors.
-    """
-    retries = 0
-    while retries < max_retries:
+    def __init__(self, annotation_guidelines: str, batch_prompt_template: str) -> None:
+        self.annotation_guidelines = annotation_guidelines
+        self.batch_prompt_template = batch_prompt_template
+
+    def build_batch_prompt(self, sentences: List[str]) -> str:
+        lines = "\n".join(f"- {s}" for s in sentences)
+        return f"{self.batch_prompt_template}\n\n{self.annotation_guidelines}\nSentences:\n{lines}"
+
+    def call_openai_api(self, prompt: str, max_retries: int = 5) -> str:
+        retries = 0
+        while retries < max_retries:
+            try:
+                response = openai.ChatCompletion.create(
+                    model="gpt-3.5-turbo",
+                    messages=[{"role": "user", "content": prompt}],
+                    max_tokens=3000,
+                    temperature=0.0
+                )
+                return response["choices"][0]["message"]["content"].strip()
+            except openai.error.RateLimitError:
+                retries += 1
+                wait_time = 10 * retries
+                print(f"[WARN] Rate limit exceeded. Retrying in {wait_time}s...")
+                time.sleep(wait_time)
+            except Exception as e:
+                print(f"[ERROR] API call failed: {e}", file=sys.stderr)
+                return ""
+        return ""
+
+    def parse_batch_response(self, resp_text: str) -> Tuple[List[str], List[dict]]:
         try:
-            response = openai.ChatCompletion.create(
-                model="gpt-3.5-turbo",
-                messages=[{"role": "user", "content": prompt}],
-                max_tokens=3000,
-                temperature=0.0
-            )
-            return response["choices"][0]["message"]["content"].strip()
-        except openai.error.RateLimitError:
-            retries += 1
-            wait_time = 10 * retries
-            print(f"[WARN] Rate limit exceeded. Retrying in {wait_time}s...")
-            time.sleep(wait_time)
-        except Exception as e:
-            print(f"[ERROR] API call failed: {e}", file=sys.stderr)
-            return ""
-    return ""
+            results = json.loads(resp_text)
+            discarded = results.get("discarded", [])
+            valid = results.get("valid", [])
+            return discarded, valid
+        except json.JSONDecodeError:
+            print("[ERROR] Failed to parse JSON response. Saving batch for review.", file=sys.stderr)
+            with open("../../OneDrive/Desktop/Causal_Analysis_in_Social_Science/failed_batch_response.txt", "w", encoding="utf-8") as fout:
+                fout.write(resp_text)
+            return [], []
 
-###############################################################################
-# 6) PARSE RESPONSE
-###############################################################################
-def parse_batch_response(resp_text: str) -> Tuple[List[str], List[dict]]:
-    """
-    Parses the API response for a batch of sentences.
-    Returns two lists:
-    - discarded: List of sentences marked as "DISCARD"
-    - valid: List of valid sentence results with tokens and labels
-    """
-    try:
-        results = json.loads(resp_text)
-        discarded = results.get("discarded", [])
-        valid = results.get("valid", [])
-        return discarded, valid
-    except json.JSONDecodeError:
-        print("[ERROR] Failed to parse JSON response. Saving batch for review.", file=sys.stderr)
-        with open("../../OneDrive/Desktop/Causal_Analysis_in_Social_Science/failed_batch_response.txt", "w", encoding="utf-8") as f:
-            f.write(resp_text)  # Save the problematic response for debugging
-        return [], []
 
-###############################################################################
-# 7) PROCESS CSV (BATCH MODE)
-###############################################################################
 def process_csv(
     input_csv: str,
     output_jsonl: str,
     sentence_column: str,
     max_rows: int,
     batch_size: int = 4
-):
-    """
-    Reads input CSV, processes sentences in batches, and writes labeled outputs to a JSONL file.
-    """
-    count = 0
+) -> None:
+    annotator = OpenAIBatchAnnotator(
+        annotation_guidelines=ANNOTATION_GUIDELINES,
+        batch_prompt_template=BATCH_CALL_PROMPT
+    )
+
+    total_annotated = 0
     batch = []
 
     with open(input_csv, "r", encoding="utf-8-sig") as fin, open(output_jsonl, "w", encoding="utf-8") as fout:
         reader = csv.DictReader(fin)
-        for row_idx, row in enumerate(reader, start=1):
-            if count >= max_rows:
+        for _, row in enumerate(reader, start=1):
+            if total_annotated >= max_rows:
                 break
-
-            sentence = row.get(sentence_column, "").strip()
-            if not sentence:
+            text = row.get(sentence_column, "").strip()
+            if not text:
                 continue
+            batch.append(text)
 
-            batch.append(sentence)
             if len(batch) == batch_size:
-                # Process the batch
-                prompt = build_batch_prompt(batch)
-                response = call_openai_api(prompt)
-                discarded, valid = parse_batch_response(response)
-
-                for valid_result in valid:
-                    fout.write(json.dumps(valid_result, ensure_ascii=False) + "\n")
-                    count += 1
-                    print(f"[INFO] Annotated: {valid_result['sentence']}")
-
+                prompt = annotator.build_batch_prompt(batch)
+                response = annotator.call_openai_api(prompt)
+                discarded, valid = annotator.parse_batch_response(response)
+                for vres in valid:
+                    fout.write(json.dumps(vres, ensure_ascii=False) + "\n")
+                    total_annotated += 1
+                    print(f"[INFO] Annotated: {vres['sentence']}")
                 if discarded:
-                    for disc_sentence in discarded:
-                        print(f"[INFO] Discarded: {disc_sentence}")
-
-                # Reset batch
+                    for disc in discarded:
+                        print(f"[INFO] Discarded: {disc}")
                 batch = []
 
-        # Process any remaining sentences in the batch
         if batch:
-            prompt = build_batch_prompt(batch)
-            response = call_openai_api(prompt)
-            discarded, valid = parse_batch_response(response)
-
-            for valid_result in valid:
-                fout.write(json.dumps(valid_result, ensure_ascii=False) + "\n")
-                count += 1
-                print(f"[INFO] Annotated: {valid_result['sentence']}")
-
+            prompt = annotator.build_batch_prompt(batch)
+            response = annotator.call_openai_api(prompt)
+            discarded, valid = annotator.parse_batch_response(response)
+            for vres in valid:
+                fout.write(json.dumps(vres, ensure_ascii=False) + "\n")
+                total_annotated += 1
+                print(f"[INFO] Annotated: {vres['sentence']}")
             if discarded:
-                for disc_sentence in discarded:
-                    print(f"[INFO] Discarded: {disc_sentence}")
+                for disc in discarded:
+                    print(f"[INFO] Discarded: {disc}")
 
-    print(f"\n[INFO] Finished. Annotated {count} sentences (max {max_rows}).")
+    print(f"\n[INFO] Finished. Annotated {total_annotated} sentences (max {max_rows}).")
     print(f"[INFO] Output in => {output_jsonl}")
 
-###############################################################################
-# 8) MAIN
-###############################################################################
-if __name__ == "__main__":
-    input_csv_file = "../../OneDrive/Desktop/Causal_Analysis_in_Social_Science/annotation_folder/causal_sentences.csv"
-    output_jsonl_file = "../../OneDrive/Desktop/Causal_Analysis_in_Social_Science/annotation_folder/annotated_output.jsonl"
+def main():
+    input_csv_file = "annotation_folder/causal_sentences.csv"
+    output_jsonl_file = "annotation_folder/annotated_output_final.jsonl"
+
     process_csv(
         input_csv=input_csv_file,
         output_jsonl=output_jsonl_file,
         sentence_column="causal_sentence",
         max_rows=3500,
-        batch_size=4  # Process 4 sentences per batch
+        batch_size=4
     )
     print("[DONE] Annotation complete.")
+
+if __name__ == "__main__":
+    main()

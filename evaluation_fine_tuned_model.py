@@ -1,39 +1,33 @@
 import json
 import torch
-from torch.utils.data import Dataset
+from torch.utils.data import Dataset, DataLoader
 from transformers import AutoTokenizer, AutoModelForTokenClassification
 from sklearn.metrics import accuracy_score, precision_recall_fscore_support
 from typing import List, Dict
 
-###############################################################################
-# 1) PATHS & HYPERPARAMETERS
-###############################################################################
-TEST_DATA_FILE = "data (annotated)/social_data_final.jsonl"  # Path to the test dataset
-MODEL_PATH = "fine-tuned-model/unicausal_finetuned"  # Fine-tuned model path
+# Global settings
+TEST_DATA_FILE = "data (annotated)/social_data_final.jsonl"
+MODEL_PATH = "fine-tuned-model/unicausal_finetuned"
 BATCH_SIZE = 8
 MAX_SEQ_LENGTH = 256
 
-###############################################################################
-# 2) LABEL MAPPINGS
-###############################################################################
 LABEL_LIST = ["O", "B-C", "I-C", "B-E", "I-E"]
 LABEL2ID = {label: i for i, label in enumerate(LABEL_LIST)}
 ID2LABEL = {i: label for i, label in enumerate(LABEL_LIST)}
 
-###############################################################################
-# 3) CUSTOM DATASET CLASS
-###############################################################################
-class TestDataset(Dataset):
-    def __init__(self, data_file: str, tokenizer, max_length: int = MAX_SEQ_LENGTH):
-        self.tokenizer = tokenizer
-        self.data = []
-
+class SocialScienceTestDataset(Dataset):
+    """
+    Dataset for social science sentences with cause-effect labels.
+    Each sample is pre-tokenized and aligned with label IDs.
+    """
+    def __init__(self, data_file: str, tokenizer, max_length: int = MAX_SEQ_LENGTH) -> None:
+        self.samples = []
         with open(data_file, "r", encoding="utf-8") as f:
             for line in f:
                 record = json.loads(line.strip())
-                tokens, labels = record["tokens"], record["labels"]
+                tokens = record["tokens"]
+                raw_labels = record["labels"]
 
-                # Tokenize and align labels
                 encoding = tokenizer(
                     tokens,
                     is_split_into_words=True,
@@ -42,93 +36,89 @@ class TestDataset(Dataset):
                     padding="max_length",
                     return_tensors="pt"
                 )
-
                 input_ids = encoding["input_ids"][0]
                 attention_mask = encoding["attention_mask"][0]
                 word_ids = encoding.word_ids()
 
                 label_ids = []
-                for word_idx in word_ids:
-                    if word_idx is None:
-                        label_ids.append(-100)  # Special tokens
+                for w_id in word_ids:
+                    if w_id is None:
+                        label_ids.append(-100)
                     else:
-                        label_ids.append(LABEL2ID[labels[word_idx]] if word_idx < len(labels) else -100)
+                        label_ids.append(LABEL2ID[raw_labels[w_id]] if w_id < len(raw_labels) else -100)
 
-                self.data.append({
+                self.samples.append({
                     "input_ids": input_ids,
                     "attention_mask": attention_mask,
                     "labels": torch.tensor(label_ids, dtype=torch.long)
                 })
 
-    def __len__(self):
-        return len(self.data)
+    def __len__(self) -> int:
+        return len(self.samples)
 
-    def __getitem__(self, idx):
-        return self.data[idx]
+    def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
+        return self.samples[idx]
 
-###############################################################################
-# 4) EVALUATION FUNCTION
-###############################################################################
-def evaluate_model():
-    # Load tokenizer and model
-    tokenizer = AutoTokenizer.from_pretrained(MODEL_PATH)
-    model = AutoModelForTokenClassification.from_pretrained(MODEL_PATH)
-    model.eval()
 
-    # Load test dataset
-    test_dataset = TestDataset(TEST_DATA_FILE, tokenizer)
-    print(f"[INFO] Loaded {len(test_dataset)} examples for evaluation.")
+class CausalModelEvaluator:
+    """
+    Evaluates a fine-tuned causal extraction model on a social science dataset.
+    """
+    def __init__(self, model_path: str = MODEL_PATH, test_file: str = TEST_DATA_FILE) -> None:
+        self.model_path = model_path
+        self.test_file = test_file
+        self.model = None
+        self.tokenizer = None
 
-    # Prepare DataLoader
-    test_loader = torch.utils.data.DataLoader(test_dataset, batch_size=BATCH_SIZE)
+    def load_model_and_tokenizer(self) -> None:
+        self.tokenizer = AutoTokenizer.from_pretrained(self.model_path)
+        self.model = AutoModelForTokenClassification.from_pretrained(self.model_path)
+        self.model.eval()
 
-    all_preds, all_labels = [], []
+    def evaluate(self) -> Dict[str, float]:
+        if not self.model or not self.tokenizer:
+            self.load_model_and_tokenizer()
 
-    # Iterate over test data
-    for batch in test_loader:
-        input_ids = batch["input_ids"]
-        attention_mask = batch["attention_mask"]
-        labels = batch["labels"]
+        dataset = SocialScienceTestDataset(self.test_file, self.tokenizer, MAX_SEQ_LENGTH)
+        print(f"[INFO] Loaded {len(dataset)} examples for evaluation.")
 
-        with torch.no_grad():
-            outputs = model(input_ids, attention_mask=attention_mask)
-            logits = outputs.logits
+        data_loader = DataLoader(dataset, batch_size=BATCH_SIZE)
+        all_preds, all_labels = [], []
 
-        # Get predictions
-        predictions = torch.argmax(logits, dim=-1)
+        for batch in data_loader:
+            with torch.no_grad():
+                outputs = self.model(batch["input_ids"], attention_mask=batch["attention_mask"])
+                logits = outputs.logits
+            preds = torch.argmax(logits, dim=-1)
 
-        # Align predictions and labels
-        for pred, true_labels in zip(predictions, labels):
-            filtered_preds = [p.item() for p, t in zip(pred, true_labels) if t != -100]
-            filtered_labels = [t.item() for t in true_labels if t != -100]
+            for pred_seq, true_seq in zip(preds, batch["labels"]):
+                filtered_preds = [p.item() for p, t in zip(pred_seq, true_seq) if t != -100]
+                filtered_labels = [t.item() for t in true_seq if t != -100]
+                all_preds.extend(filtered_preds)
+                all_labels.extend(filtered_labels)
 
-            all_preds.extend(filtered_preds)
-            all_labels.extend(filtered_labels)
+        accuracy = accuracy_score(all_labels, all_preds)
+        precision, recall, f1, _ = precision_recall_fscore_support(all_labels, all_preds, average="macro")
 
-    # Convert IDs to labels
-    all_preds_labels = [ID2LABEL[p] for p in all_preds]
-    all_labels_labels = [ID2LABEL[l] for l in all_labels]
+        print("[RESULTS] Evaluation Metrics:")
+        print(f"Accuracy: {accuracy:.4f}")
+        print(f"Precision: {precision:.4f}")
+        print(f"Recall: {recall:.4f}")
+        print(f"F1 Score: {f1:.4f}")
 
-    # Calculate metrics
-    accuracy = accuracy_score(all_labels, all_preds)
-    precision, recall, f1, _ = precision_recall_fscore_support(all_labels, all_preds, average="macro")
+        return {
+            "accuracy": accuracy,
+            "precision": precision,
+            "recall": recall,
+            "f1": f1
+        }
 
-    print("[RESULTS] Evaluation Metrics:")
-    print(f"Accuracy: {accuracy:.4f}")
-    print(f"Precision: {precision:.4f}")
-    print(f"Recall: {recall:.4f}")
-    print(f"F1 Score: {f1:.4f}")
 
-    return {
-        "accuracy": accuracy,
-        "precision": precision,
-        "recall": recall,
-        "f1": f1,
-    }
-
-###############################################################################
-# 5) MAIN FUNCTION
-###############################################################################
-if __name__ == "__main__":
-    metrics = evaluate_model()
+def main():
+    evaluator = CausalModelEvaluator()
+    evaluator.evaluate()
     print("[DONE] Evaluation completed.")
+
+
+if __name__ == "__main__":
+    main()

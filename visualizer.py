@@ -6,16 +6,13 @@ from dash import Dash, dcc, html, Input, Output
 import plotly.express as px
 from transformers import AutoTokenizer, AutoModelForTokenClassification
 
-###############################################################################
-# CONFIGURATION
-###############################################################################
+# Model and data paths
 MODEL_NAME = "tanfiona/unicausal-tok-baseline"
 DATA_FILE = "data (annotated)/social_data_final.jsonl"
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 LABEL_LIST = ["O", "B-C", "I-C", "B-E", "I-E"]
-LABEL2ID = {label: i for i, label in enumerate(LABEL_LIST)}
-ID2LABEL = {i: label for i, label in enumerate(LABEL_LIST)}
+ID2LABEL = {i: lbl for i, lbl in enumerate(LABEL_LIST)}
 LABEL_COLORS = {
     "O": "black",
     "B-C": "red",
@@ -24,163 +21,154 @@ LABEL_COLORS = {
     "I-E": "cyan"
 }
 
-###############################################################################
-# LOAD MODEL AND DATA
-###############################################################################
-def load_model_and_tokenizer():
-    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
-    model = AutoModelForTokenClassification.from_pretrained(MODEL_NAME).to(DEVICE)
-    return model, tokenizer
 
-def load_annotated_data(data_file):
-    with open(data_file, "r", encoding="utf-8") as f:
-        data = [json.loads(line.strip()) for line in f]
-    # Remove `[CLS]` and `[SEP]` tokens
-    for record in data:
-        record["tokens"] = [token for token in record["tokens"] if token not in ["[CLS]", "[SEP]"]]
-        record["labels"] = record["labels"][: len(record["tokens"])]
-    return data
+class TokenClassificationVisualizer:
+    """Loads a token-classification model, annotated data, and sets up a Dash app for visualization."""
 
-###############################################################################
-# PREDICT FUNCTION
-###############################################################################
-def predict_and_visualize(sentence_tokens, model, tokenizer):
-    encoding = tokenizer.encode_plus(
-        sentence_tokens,
-        is_split_into_words=True,
-        add_special_tokens=False,
-        return_tensors="pt",
-        padding=True,
-        truncation=True
-    )
-    input_ids = encoding["input_ids"].to(DEVICE)
-    attention_mask = encoding["attention_mask"].to(DEVICE)
+    def __init__(self, model_name: str, data_file: str) -> None:
+        self.model_name = model_name
+        self.data_file = data_file
+        self.model, self.tokenizer = self._load_model_and_tokenizer()
+        self.data = self._load_annotated_data()
+        self.app = Dash(__name__)
+        self._configure_app_layout()
 
-    with torch.no_grad():
-        outputs = model(input_ids, attention_mask=attention_mask)
-        logits = outputs.logits[0]
+    def _load_model_and_tokenizer(self):
+        tokenizer = AutoTokenizer.from_pretrained(self.model_name)
+        model = AutoModelForTokenClassification.from_pretrained(self.model_name).to(DEVICE)
+        return model, tokenizer
 
-    probs = torch.softmax(logits, dim=-1).cpu().numpy()
-    predicted_labels = np.argmax(probs, axis=-1)
+    def _load_annotated_data(self):
+        with open(self.data_file, "r", encoding="utf-8") as fin:
+            records = [json.loads(line.strip()) for line in fin]
 
-    return probs, predicted_labels
+        # Remove [CLS], [SEP] tokens if any
+        for rec in records:
+            rec["tokens"] = [t for t in rec["tokens"] if t not in ["[CLS]", "[SEP]"]]
+            rec["labels"] = rec["labels"][: len(rec["tokens"])]
+        return records
 
-###############################################################################
-# COLOR-CODED SENTENCE
-###############################################################################
-def color_code_sentence(tokens, labels):
-    """
-    Create a list of styled html.Span elements for color-coded tokens.
-    """
-    return [
-        html.Span(
-            token,
-            style={"color": LABEL_COLORS.get(label, "black"), "marginRight": "5px"}
+    def _predict_and_visualize(self, tokens):
+        enc = self.tokenizer.encode_plus(
+            tokens,
+            is_split_into_words=True,
+            add_special_tokens=False,
+            return_tensors="pt",
+            padding=True,
+            truncation=True
         )
-        for token, label in zip(tokens, labels)
-    ]
+        input_ids = enc["input_ids"].to(DEVICE)
+        attention_mask = enc["attention_mask"].to(DEVICE)
 
-###############################################################################
-# DASH APP SETUP
-###############################################################################
-model, tokenizer = load_model_and_tokenizer()
-data = load_annotated_data(DATA_FILE)
+        with torch.no_grad():
+            out = self.model(input_ids, attention_mask=attention_mask)
+            logits = out.logits[0]
 
-app = Dash(__name__)
+        probs = torch.softmax(logits, dim=-1).cpu().numpy()
+        pred_ids = np.argmax(probs, axis=-1)
+        return probs, pred_ids
 
-app.layout = html.Div(
-    [
-        html.H1(
-            "Causal Relationship Token Classification Visualizer",
-            style={"textAlign": "center", "marginBottom": "20px"},
-        ),
-        dcc.Slider(
-            id="sentence-slider",
-            min=0,
-            max=len(data) - 1,
-            step=1,
-            value=0,
-            marks={
-                i: f"Sentence {i+1}"
-                for i in range(0, len(data), max(1, len(data) // 10))
-            },
-        ),
-        html.Div(
-            id="sentence-display",
-            style={"textAlign": "center", "margin": "20px", "fontSize": "18px"},
-        ),
-        dcc.Graph(id="heatmap"),
-        html.Div(
-            id="label-comparison",
-            style={"textAlign": "center", "marginTop": "20px", "fontSize": "18px"},
-        ),
-        html.Div(
-            children=[
-                html.P("Label Color Coding:", style={"fontWeight": "bold"}),
-                html.Div(
-                    [
-                        html.Span("O: Outside", style={"color": "black", "marginRight": "20px"}),
-                        html.Span("B-C: Begin Cause", style={"color": "red", "marginRight": "20px"}),
-                        html.Span("I-C: Inside Cause", style={"color": "orange", "marginRight": "20px"}),
-                        html.Span("B-E: Begin Effect", style={"color": "blue", "marginRight": "20px"}),
-                        html.Span("I-E: Inside Effect", style={"color": "cyan", "marginRight": "20px"}),
-                    ],
-                    style={"textAlign": "center"},
+    def _color_code_sentence(self, tokens, labels):
+        return [
+            html.Span(
+                token,
+                style={"color": LABEL_COLORS.get(lbl, "black"), "marginRight": "5px"}
+            )
+            for token, lbl in zip(tokens, labels)
+        ]
+
+    def _configure_app_layout(self):
+        self.app.layout = html.Div(
+            [
+                html.H1(
+                    "Causal Relationship Token Classification Visualizer",
+                    style={"textAlign": "center", "marginBottom": "20px"},
                 ),
+                dcc.Slider(
+                    id="sentence-slider",
+                    min=0,
+                    max=len(self.data) - 1,
+                    step=1,
+                    value=0,
+                    marks={
+                        i: f"Sentence {i+1}"
+                        for i in range(0, len(self.data), max(1, len(self.data) // 10))
+                    },
+                ),
+                html.Div(
+                    id="sentence-display",
+                    style={"textAlign": "center", "margin": "20px", "fontSize": "18px"},
+                ),
+                dcc.Graph(id="heatmap"),
+                html.Div(
+                    id="label-comparison",
+                    style={"textAlign": "center", "marginTop": "20px", "fontSize": "18px"},
+                ),
+                html.Div(
+                    children=[
+                        html.P("Label Color Coding:", style={"fontWeight": "bold"}),
+                        html.Div(
+                            [
+                                html.Span("O: Outside", style={"color": "black", "marginRight": "20px"}),
+                                html.Span("B-C: Begin Cause", style={"color": "red", "marginRight": "20px"}),
+                                html.Span("I-C: Inside Cause", style={"color": "orange", "marginRight": "20px"}),
+                                html.Span("B-E: Begin Effect", style={"color": "blue", "marginRight": "20px"}),
+                                html.Span("I-E: Inside Effect", style={"color": "cyan", "marginRight": "20px"}),
+                            ],
+                            style={"textAlign": "center"},
+                        ),
+                    ],
+                    style={"marginTop": "20px"},
+                ),
+            ]
+        )
+
+        @self.app.callback(
+            [
+                Output("sentence-display", "children"),
+                Output("heatmap", "figure"),
+                Output("label-comparison", "children"),
             ],
-            style={"marginTop": "20px"},
-        ),
-    ]
-)
+            [Input("sentence-slider", "value")],
+        )
+        def update_visualization(index):
+            rec = self.data[index]
+            sentence = rec["sentence"]
+            tokens = rec["tokens"]
+            true_labels = rec["labels"]
 
-###############################################################################
-# CALLBACKS
-###############################################################################
-@app.callback(
-    [Output("sentence-display", "children"),
-     Output("heatmap", "figure"),
-     Output("label-comparison", "children")],
-    [Input("sentence-slider", "value")],
-)
-def update_visualization(index):
-    example = data[index]
-    sentence = example["sentence"]
-    tokens = example["tokens"]
-    true_labels = example["labels"]
+            probs, pred_ids = self._predict_and_visualize(tokens)
+            pred_labels = [ID2LABEL[i] for i in pred_ids]
+            probs = probs[: len(tokens), :]
 
-    probs, predicted_labels = predict_and_visualize(tokens, model, tokenizer)
-    predicted_label_names = [ID2LABEL[label] for label in predicted_labels]
+            fig = px.imshow(
+                probs.T,
+                labels=dict(x="Tokens", y="Labels", color="Probability"),
+                x=tokens,
+                y=LABEL_LIST,
+                title="Token-to-Label Probability Heatmap",
+                aspect="auto",
+            )
+            fig.update_xaxes(tickangle=45)
 
-    probs = probs[:len(tokens), :]  # Adjust probabilities to match token length
+            predicted_colored = self._color_code_sentence(tokens, pred_labels)
+            true_colored = self._color_code_sentence(tokens, true_labels)
+            comparison = html.Div(
+                [
+                    html.Div(["Predicted: "] + predicted_colored, style={"marginBottom": "10px"}),
+                    html.Div(["True: "] + true_colored),
+                ],
+                style={"textAlign": "center", "marginTop": "20px"},
+            )
+            return sentence, fig, comparison
 
-    fig = px.imshow(
-        probs.T,
-        labels=dict(x="Tokens", y="Labels", color="Probability"),
-        x=tokens,
-        y=LABEL_LIST,
-        title="Token-to-Label Probability Heatmap",
-        aspect="auto",
-    )
-    fig.update_xaxes(tickangle=45)
+    def run(self, debug=True):
+        self.app.run_server(debug=debug)
 
-    predicted_colored = color_code_sentence(tokens, predicted_label_names)
-    true_colored = color_code_sentence(tokens, true_labels)
 
-    comparison = html.Div(
-        [
-            html.Div(
-                ["Predicted: "] + predicted_colored,
-                style={"marginBottom": "10px"},
-            ),
-            html.Div(["True: "] + true_colored),
-        ],
-        style={"textAlign": "center", "marginTop": "20px"},
-    )
+def main():
+    visualizer = TokenClassificationVisualizer(MODEL_NAME, DATA_FILE)
+    visualizer.run(debug=True)
 
-    return sentence, fig, comparison
-
-###############################################################################
-# RUN APP
-###############################################################################
 if __name__ == "__main__":
-    app.run_server(debug=True)
+    main()

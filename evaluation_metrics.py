@@ -1,24 +1,24 @@
-# Code Cell 1: evaluation_metrics.py
 import os
 import csv
 import json
 import re
-from typing import List, Dict, Any
-from seqeval.metrics import precision_score, recall_score, f1_score, accuracy_score, classification_report
-from sklearn.metrics import confusion_matrix
 import numpy as np
-from transformers import AutoTokenizer, AutoModelForTokenClassification, pipeline
+from typing import List, Dict, Any
 
-##############################################################################
-# BASE CLASS FOR COMMON FUNCTIONALITY
-##############################################################################
+from seqeval.metrics import (
+    precision_score, recall_score, f1_score, accuracy_score
+)
+from sklearn.metrics import confusion_matrix
+from transformers import (
+    AutoTokenizer,
+    AutoModelForTokenClassification,
+    pipeline
+)
 
 class BaseEvaluator:
     """
-    Base class to handle shared functionalities:
-      - Model pipeline loading.
-      - Token label prediction.
-      - Label unification.
+    Shared functionalities for token classification pipeline,
+    label prediction, and label unification.
     """
     MODEL_NAME = "tanfiona/unicausal-tok-baseline"
     DEVICE_ID = 0
@@ -30,295 +30,245 @@ class BaseEvaluator:
     }
 
     def load_pipeline(self):
-        """
-        Load the model pipeline for token classification.
-        """
         tokenizer = AutoTokenizer.from_pretrained(self.MODEL_NAME)
         model = AutoModelForTokenClassification.from_pretrained(self.MODEL_NAME)
-        pipe = pipeline(
+        return pipeline(
             task="token-classification",
             model=model,
             tokenizer=tokenizer,
             aggregation_strategy="simple",
             device=self.DEVICE_ID
         )
-        return pipe
 
     def predict_labels_on_tokens(self, tokens: List[str], pipe) -> List[str]:
-        """
-        Predict token labels using the model pipeline.
-        """
-        model_text = " ".join(tokens)
-        preds = pipe(model_text)
-        char_labels = ["O"] * len(model_text)
+        text = " ".join(tokens)
+        predictions = pipe(text)
+        char_labels = ["O"] * len(text)
 
-        for pr in preds:
-            grp = pr["entity_group"]
-            mapped_label = self.LABEL_MAPPING.get(grp, "O")
-            s_i, e_i = pr["start"], pr["end"]
-            if s_i < 0 or e_i > len(model_text):
+        for pred in predictions:
+            group = pred["entity_group"]
+            mapped_label = self.LABEL_MAPPING.get(group, "O")
+            start, end = pred["start"], pred["end"]
+            if not (0 <= start < end <= len(text)):
                 continue
             if mapped_label in ("B-C", "I-C"):
-                for c_idx in range(s_i, e_i):
-                    char_labels[c_idx] = "C"
+                for idx in range(start, end):
+                    char_labels[idx] = "C"
             elif mapped_label in ("B-E", "I-E"):
-                for c_idx in range(s_i, e_i):
-                    char_labels[c_idx] = "E"
+                for idx in range(start, end):
+                    char_labels[idx] = "E"
 
-        pred_labels = []
-        char_ptr = 0
-        for t in tokens:
-            seg = char_labels[char_ptr: char_ptr + len(t)]
-            if all(x == "O" for x in seg):
-                pred_labels.append("O")
+        final_labels = []
+        pointer = 0
+        for token in tokens:
+            segment = char_labels[pointer:pointer + len(token)]
+            if all(lbl == "O" for lbl in segment):
+                final_labels.append("O")
             else:
-                if "C" in seg:
-                    if seg[0] == "C":
-                        pred_labels.append("B-C")
-                    else:
-                        pred_labels.append("I-C")
-                elif "E" in seg:
-                    if seg[0] == "E":
-                        pred_labels.append("B-E")
-                    else:
-                        pred_labels.append("I-E")
+                if "C" in segment:
+                    final_labels.append("B-C" if segment[0] == "C" else "I-C")
+                elif "E" in segment:
+                    final_labels.append("B-E" if segment[0] == "E" else "I-E")
                 else:
-                    pred_labels.append("O")
-            char_ptr += len(t) + 1
+                    final_labels.append("O")
+            pointer += len(token) + 1
 
-        return pred_labels
+        return final_labels
 
-    def unify_label(self, lab: str) -> str:
-        """
-        Simplify token labels to "C", "E", or "O".
-        """
-        if lab in ("B-C", "I-C"):
+    def unify_label(self, label: str) -> str:
+        if label in ("B-C", "I-C"):
             return "C"
-        elif lab in ("B-E", "I-E"):
+        if label in ("B-E", "I-E"):
             return "E"
-        else:
-            return "O"
+        return "O"
 
-##############################################################################
-# ARG-BASED EVALUATOR
-##############################################################################
 
 class ArgBasedEvaluator(BaseEvaluator):
     """
     Evaluator for ARG-based CSV dataset.
     """
-    GENERAL_DATA_FILE = r"C:\\Users\\aader\\PycharmProjects\\Causal_Analysis_in_Social_Science\\data (annotated)\\general_data.csv"
+    DATA_FILE = (
+        "data (annotated)/general_data.csv"
+    )
 
-    def read_data_file(self) -> List[dict]:
-        if not os.path.exists(self.GENERAL_DATA_FILE):
-            raise FileNotFoundError(f"No CSV found at: {self.GENERAL_DATA_FILE}")
+    def read_data_file(self) -> List[Dict[str, str]]:
+        if not os.path.exists(self.DATA_FILE):
+            raise FileNotFoundError(f"No CSV found at: {self.DATA_FILE}")
 
-        data = []
-        with open(self.GENERAL_DATA_FILE, "r", encoding="utf-8-sig") as f:
-            reader = csv.DictReader(f)
-            fieldnames = reader.fieldnames
-            if not fieldnames:
-                raise ValueError("No columns found in general_data.csv. Possibly empty?")
-
-            required_cols = {"text", "text_w_pairs"}
-            missing = required_cols - set(fieldnames)
+        entries = []
+        with open(self.DATA_FILE, "r", encoding="utf-8-sig") as fin:
+            reader = csv.DictReader(fin)
+            fieldnames = reader.fieldnames or []
+            required = {"text", "text_w_pairs"}
+            missing = required - set(fieldnames)
             if missing:
-                raise KeyError(
-                    f"Missing columns {missing} in general_data.csv. Found columns: {fieldnames}"
-                )
+                raise KeyError(f"Missing columns: {missing}")
 
             for row in reader:
                 raw_text = row["text"]
-                text_w_pairs = row["text_w_pairs"]
-                if not raw_text or not text_w_pairs:
+                paired_text = row["text_w_pairs"]
+                if not raw_text or not paired_text:
                     continue
-                if ("<ARG0>" not in text_w_pairs) and ("<ARG1>" not in text_w_pairs):
+                if ("<ARG0>" not in paired_text) and ("<ARG1>" not in paired_text):
                     continue
-
-                data.append({
-                    "text": raw_text,
-                    "text_w_pairs": text_w_pairs
-                })
-        return data
+                entries.append({"text": raw_text, "text_w_pairs": paired_text})
+        return entries
 
     def build_gold_token_labels(self, text: str, text_w_pairs: str):
         raw_tokens = text.split()
         pair_tokens = text_w_pairs.split()
-
         gold_labels = []
-        label_state = "O"
+        current_label = "O"
 
-        def strip_tags(tok: str) -> str:
-            tok_clean = re.sub(r"</?ARG[01]>", "", tok)
-            tok_clean = re.sub(r"</?SIG\d*>", "", tok)
-            return tok_clean.strip()
+        def strip_tags(token: str) -> str:
+            token = re.sub(r"</?ARG[01]>", "", token)
+            token = re.sub(r"</?SIG\d*>", "", token)
+            return token.strip()
 
         cleaned_tokens = []
-        for p_tok in pair_tokens:
-            local_label = label_state
+        for ptok in pair_tokens:
+            lbl = current_label
+            if "<ARG0>" in ptok:
+                lbl = "B-C"
+                current_label = "I-C"
+            elif "</ARG0>" in ptok and current_label in ("I-C", "B-C"):
+                lbl = "I-C"
+                current_label = "O"
+            elif "<ARG1>" in ptok:
+                lbl = "B-E"
+                current_label = "I-E"
+            elif "</ARG1>" in ptok and current_label in ("I-E", "B-E"):
+                lbl = "I-E"
+                current_label = "O"
 
-            if "<ARG0>" in p_tok:
-                local_label = "B-C"
-                label_state = "I-C"
-            elif "</ARG0>" in p_tok:
-                if label_state in ("I-C", "B-C"):
-                    local_label = "I-C"
-                label_state = "O"
-            elif "<ARG1>" in p_tok:
-                local_label = "B-E"
-                label_state = "I-E"
-            elif "</ARG1>" in p_tok:
-                if label_state in ("I-E", "B-E"):
-                    local_label = "I-E"
-                label_state = "O"
+            stripped = strip_tags(ptok)
+            if stripped:
+                cleaned_tokens.append(stripped)
+                gold_labels.append(lbl)
 
-            cleaned_tok = strip_tags(p_tok)
-            if not cleaned_tok:
-                continue
-            cleaned_tokens.append(cleaned_tok)
-            gold_labels.append(local_label)
+        limit = min(len(raw_tokens), len(cleaned_tokens))
+        return raw_tokens[:limit], gold_labels[:limit]
 
-        aligned_len = min(len(raw_tokens), len(cleaned_tokens))
-        tokens = raw_tokens[:aligned_len]
-        labels = gold_labels[:aligned_len]
-        return tokens, labels
-
-##############################################################################
-# SOCIAL SCIENCE EVALUATOR
-##############################################################################
 
 class SocialScienceEvaluator(BaseEvaluator):
     """
     Evaluator for Social Science JSONL dataset.
     """
     JSON_FILES = [
-        r"C:\\Users\\aader\\PycharmProjects\\Causal_Analysis_in_Social_Science\\data (annotated)\\social_data_1.jsonl",
-        r"C:\\Users\\aader\\PycharmProjects\\Causal_Analysis_in_Social_Science\\data (annotated)\\social_data_2.jsonl",
+        "data (annotated)/social_data_1.jsonl",
+        "data (annotated)/social_data_2.jsonl"
     ]
 
     def read_json_files(self) -> List[Dict[str, Any]]:
-        data = []
-        for fpath in self.JSON_FILES:
-            if not os.path.exists(fpath):
-                raise FileNotFoundError(f"JSON file not found: {fpath}")
-
-            with open(fpath, "r", encoding="utf-8") as f:
-                for line in f:
+        all_data = []
+        for path in self.JSON_FILES:
+            if not os.path.exists(path):
+                raise FileNotFoundError(f"JSON file not found: {path}")
+            with open(path, "r", encoding="utf-8") as fin:
+                for line in fin:
                     obj = json.loads(line.strip())
-                    text = obj["text"]
+                    text = obj.get("text", "")
                     entities = obj.get("entities", [])
-                    ce_entities = [e for e in entities if e["label"].lower() in ["cause", "effect"]]
-                    if not ce_entities:
+                    cause_effect = [e for e in entities if e["label"].lower() in ("cause", "effect")]
+                    if not cause_effect:
                         continue
-                    data.append({"id": obj["id"], "text": text, "entities": ce_entities})
-        return data
+                    all_data.append({"id": obj["id"], "text": text, "entities": cause_effect})
+        return all_data
 
     def build_gold_labels(self, text: str, entities: List[Dict[str, Any]]):
-        raw_tokens = text.split()
-        joined_text = " ".join(raw_tokens)
-        char_positions = []
+        tokens = text.split()
+        char_map = []
         idx = 0
-        for rt in raw_tokens:
-            start_i = idx
-            end_i = idx + len(rt)
-            char_positions.append((start_i, end_i))
+        for tok in tokens:
+            start_i, end_i = idx, idx + len(tok)
+            char_map.append((start_i, end_i))
             idx = end_i + 1
 
-        cause_intervals = []
-        effect_intervals = []
-        for e in entities:
-            lab = e["label"].lower()
-            st = e["start_offset"]
-            en = e["end_offset"]
-            if lab == "cause":
-                cause_intervals.append((st, en))
-            elif lab == "effect":
-                effect_intervals.append((st, en))
+        c_spans, e_spans = [], []
+        for ent in entities:
+            lb = ent["label"].lower()
+            st, en = ent["start_offset"], ent["end_offset"]
+            if lb == "cause":
+                c_spans.append((st, en))
+            elif lb == "effect":
+                e_spans.append((st, en))
 
-        labels = ["O"] * len(raw_tokens)
+        labels = ["O"] * len(tokens)
 
-        def label_span(span_list, b_label, i_label):
+        def label_spans(span_list, btag, itag):
             in_span = False
-            for (st, en) in span_list:
-                for t_i, (c_start, c_end) in enumerate(char_positions):
-                    if c_end > st and c_start < en:
+            for start, end in span_list:
+                for i, (cstart, cend) in enumerate(char_map):
+                    if cend > start and cstart < end:
                         if not in_span:
-                            labels[t_i] = b_label
+                            labels[i] = btag
                             in_span = True
                         else:
-                            if labels[t_i] == "O" or labels[t_i].startswith("B-"):
-                                labels[t_i] = i_label
-                    else:
-                        if c_start >= en:
-                            in_span = False
+                            if labels[i] in ("O", btag):
+                                labels[i] = itag
+                    elif cstart >= end:
+                        in_span = False
 
-        label_span(cause_intervals, "B-C", "I-C")
-        label_span(effect_intervals, "B-E", "I-E")
+        label_spans(c_spans, "B-C", "I-C")
+        label_spans(e_spans, "B-E", "I-E")
+        return tokens, labels
 
-        return raw_tokens, labels
 
-##############################################################################
-# MAIN
-##############################################################################
+def compute_confusion_matrix(gold: List[List[str]], pred: List[List[str]]):
+    flattened_gold = [g for seq in gold for g in seq]
+    flattened_pred = [p for seq in pred for p in seq]
+    return confusion_matrix(flattened_gold, flattened_pred, labels=["O", "C", "E"])
 
-def compute_confusion_matrix(gold, pred):
-    flat_gold = [item for sublist in gold for item in sublist]
-    flat_pred = [item for sublist in pred for item in sublist]
-    matrix = confusion_matrix(flat_gold, flat_pred, labels=["O", "C", "E"])
-    return matrix
 
 def main():
     print("\n===== ARG-BASED EVALUATION =====")
-    arg_evaluator = ArgBasedEvaluator()
-    pipe = arg_evaluator.load_pipeline()
-    data = arg_evaluator.read_data_file()
+    arg_eval = ArgBasedEvaluator()
+    arg_pipe = arg_eval.load_pipeline()
+    arg_data = arg_eval.read_data_file()
 
-    gold_seq = []
-    pred_seq = []
-
-    for row in data:
-        tokens, gold_labels = arg_evaluator.build_gold_token_labels(row["text"], row["text_w_pairs"])
+    arg_gold, arg_pred = [], []
+    for row in arg_data:
+        tokens, gold_labels = arg_eval.build_gold_token_labels(row["text"], row["text_w_pairs"])
         if not tokens:
             continue
-        pred_labels = arg_evaluator.predict_labels_on_tokens(tokens, pipe)
-        L = min(len(gold_labels), len(pred_labels))
-        gold_seq.append([arg_evaluator.unify_label(g) for g in gold_labels[:L]])
-        pred_seq.append([arg_evaluator.unify_label(p) for p in pred_labels[:L]])
+        pred_labels = arg_eval.predict_labels_on_tokens(tokens, arg_pipe)
+        limit = min(len(gold_labels), len(pred_labels))
+        arg_gold.append([arg_eval.unify_label(g) for g in gold_labels[:limit]])
+        arg_pred.append([arg_eval.unify_label(p) for p in pred_labels[:limit]])
 
-    print(f"Accuracy:  {accuracy_score(gold_seq, pred_seq):.4f}")
-    print(f"Precision: {precision_score(gold_seq, pred_seq):.4f}")
-    print(f"Recall:    {recall_score(gold_seq, pred_seq):.4f}")
-    print(f"F1 Score:  {f1_score(gold_seq, pred_seq):.4f}")
+    print(f"Accuracy:  {accuracy_score(arg_gold, arg_pred):.4f}")
+    print(f"Precision: {precision_score(arg_gold, arg_pred):.4f}")
+    print(f"Recall:    {recall_score(arg_gold, arg_pred):.4f}")
+    print(f"F1 Score:  {f1_score(arg_gold, arg_pred):.4f}")
 
-    matrix = compute_confusion_matrix(gold_seq, pred_seq)
+    arg_matrix = compute_confusion_matrix(arg_gold, arg_pred)
     print("Confusion Matrix (ARG-Based):")
-    print(matrix)
+    print(arg_matrix)
 
     print("\n===== SOCIAL SCIENCE EVALUATION =====")
-    social_evaluator = SocialScienceEvaluator()
-    pipe = social_evaluator.load_pipeline()
-    data = social_evaluator.read_json_files()
+    soc_eval = SocialScienceEvaluator()
+    soc_pipe = soc_eval.load_pipeline()
+    soc_data = soc_eval.read_json_files()
 
-    gold_seq = []
-    pred_seq = []
-
-    for entry in data:
-        tokens, gold_labels = social_evaluator.build_gold_labels(entry["text"], entry["entities"])
+    soc_gold, soc_pred = [], []
+    for entry in soc_data:
+        tokens, gold_labels = soc_eval.build_gold_labels(entry["text"], entry["entities"])
         if not tokens:
             continue
-        pred_labels = social_evaluator.predict_labels_on_tokens(tokens, pipe)
-        L = min(len(gold_labels), len(pred_labels))
-        gold_seq.append([social_evaluator.unify_label(g) for g in gold_labels[:L]])
-        pred_seq.append([social_evaluator.unify_label(p) for p in pred_labels[:L]])
+        pred_labels = soc_eval.predict_labels_on_tokens(tokens, soc_pipe)
+        limit = min(len(gold_labels), len(pred_labels))
+        soc_gold.append([soc_eval.unify_label(g) for g in gold_labels[:limit]])
+        soc_pred.append([soc_eval.unify_label(p) for p in pred_labels[:limit]])
 
-    print(f"Accuracy:  {accuracy_score(gold_seq, pred_seq):.4f}")
-    print(f"Precision: {precision_score(gold_seq, pred_seq):.4f}")
-    print(f"Recall:    {recall_score(gold_seq, pred_seq):.4f}")
-    print(f"F1 Score:  {f1_score(gold_seq, pred_seq):.4f}")
+    print(f"Accuracy:  {accuracy_score(soc_gold, soc_pred):.4f}")
+    print(f"Precision: {precision_score(soc_gold, soc_pred):.4f}")
+    print(f"Recall:    {recall_score(soc_gold, soc_pred):.4f}")
+    print(f"F1 Score:  {f1_score(soc_gold, soc_pred):.4f}")
 
-    matrix = compute_confusion_matrix(gold_seq, pred_seq)
+    soc_matrix = compute_confusion_matrix(soc_gold, soc_pred)
     print("Confusion Matrix (Social Science):")
-    print(matrix)
+    print(soc_matrix)
+
 
 if __name__ == "__main__":
     main()

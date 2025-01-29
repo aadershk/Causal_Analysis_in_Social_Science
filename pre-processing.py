@@ -1,113 +1,81 @@
 import os
-import fitz  # PyMuPDF
-import spacy
 import re
-import wordninja
 import csv
+import fitz
+import spacy
 import torch
+import wordninja
+import random
+from typing import List
 from concurrent.futures import ProcessPoolExecutor
 from langdetect import detect, LangDetectException
-from transformers import AutoTokenizer, AutoModelForSequenceClassification
-
-##############################################################################
-# 1) PIPELINE CONFIG & GLOBAL SETUP
-##############################################################################
+from transformers import (
+    AutoTokenizer,
+    AutoModelForSequenceClassification
+)
 
 class SSCBertModel:
     """
-    Loads the 'ssc_bert' model and tokenizer on GPU if available.
-    Provides a method to classify batches of sentences (causal vs. non-causal).
+    Loads an SSC-BERT model for classifying sentences as causal or not.
     """
-    def __init__(self, model_name="rasoultilburg/ssc_bert"):
+    def __init__(self, model_name: str = "rasoultilburg/ssc_bert"):
         self.tokenizer = AutoTokenizer.from_pretrained(model_name)
         self.model = AutoModelForSequenceClassification.from_pretrained(model_name)
         self.model.eval()
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.model.to(self.device)
 
-    def classify_sentences(self, sentences, batch_size=128):
-        """
-        Classify each sentence as 0 (non-causal) or 1 (causal).
-        Returns a list of only the causal sentences.
-        """
-        causal_sentences = []
+    def classify_sentences(self, sentences: List[str], batch_size: int = 128) -> List[str]:
+        causal_sents = []
         for i in range(0, len(sentences), batch_size):
-            batch = sentences[i:i + batch_size]
-            tokens = self.tokenizer(batch, padding=True, truncation=True, max_length=512, return_tensors="pt")
-            tokens = tokens.to(self.device)
+            batch = sentences[i : i + batch_size]
+            tokens = self.tokenizer(
+                batch,
+                padding=True,
+                truncation=True,
+                max_length=512,
+                return_tensors="pt"
+            )
+            tokens = {k: v.to(self.device) for k, v in tokens.items()}
 
             with torch.no_grad(), torch.cuda.amp.autocast():
                 outputs = self.model(**tokens)
-                logits = outputs.logits
-                predictions = torch.argmax(logits, dim=1).cpu().numpy()
+                preds = torch.argmax(outputs.logits, dim=1).cpu().numpy()
 
-            # collect only those sentences predicted as causal (pred==1)
-            for sentence, pred in zip(batch, predictions):
+            for sent, pred in zip(batch, preds):
                 if pred == 1:
-                    causal_sentences.append(sentence)
+                    causal_sents.append(sent)
 
-            del tokens, outputs, logits
+            del tokens, outputs
             torch.cuda.empty_cache()
 
-        return causal_sentences
+        return causal_sents
 
 
 class PDFPipeline:
     """
-    Handles:
-      - Extracting text from PDF
-      - Splitting text into sentences
-      - Preprocessing sentences (parallel)
-      - Writing causal sentences to CSV
+    Extracts text from PDFs, preprocesses it, classifies sentences with SSC-BERT, and writes to CSV.
     """
-
     spacy_nlp = spacy.load("en_core_web_sm")
 
     def __init__(self, ssc_model: SSCBertModel):
-        """
-        ssc_model: an instance of SSCBertModel
-        """
         self.ssc_model = ssc_model
 
-    ##########################################################################
-    # EXTRACT & SPLIT
-    ##########################################################################
     @staticmethod
-    def extract_pdf_text(pdf_path):
-        """
-        Opens the PDF with PyMuPDF and concatenates text from each page.
-        """
+    def extract_pdf_text(pdf_path: str) -> str:
         with fitz.open(pdf_path) as doc:
-            text = "".join(page.get_text() for page in doc)
-        return text
+            return "".join(page.get_text() for page in doc)
 
     @classmethod
-    def split_into_sentences(cls, text):
-        """
-        Uses spaCy to split text into sentences, removing empty lines.
-        """
+    def split_into_sentences(cls, text: str) -> List[str]:
         doc = cls.spacy_nlp(text)
-        return [sent.text.strip() for sent in doc.sents if len(sent.text.strip()) > 0]
+        return [sent.text.strip() for sent in doc.sents if sent.text.strip()]
 
-    ##########################################################################
-    # PREPROCESS
-    ##########################################################################
     @staticmethod
-    def preprocess_text(text):
-        """
-        - Removes newlines/tabs
-        - Skips short (<50 chars) or non-English
-        - Replaces ligatures
-        - Splits words with wordninja
-        - Strips
-        - Skips if <30 chars post-split
-        Returns preprocessed string or None.
-        """
+    def preprocess_text(text: str) -> str:
         text = re.sub(r'[\n\t\003]', ' ', text)
-
         if len(text.strip()) < 50:
             return None
-
         try:
             if detect(text) != 'en':
                 return None
@@ -115,73 +83,48 @@ class PDFPipeline:
             return None
 
         ligatures = {"ﬁ": "fi", "ﬂ": "fl"}
-        for ligature, replacement in ligatures.items():
-            text = text.replace(ligature, replacement)
+        for lig, rep in ligatures.items():
+            text = text.replace(lig, rep)
 
         text = ' '.join(wordninja.split(text))
         text = re.sub(r'\s+', ' ', text).strip()
-
         if len(text) < 30:
             return None
-
         return text
 
     @staticmethod
-    def preprocess_sentences_parallel(sentences):
-        """
-        Parallel map of preprocess_text across all sentences.
-        Returns only non-None results.
-        """
+    def preprocess_sentences_parallel(sentences: List[str]) -> List[str]:
         with ProcessPoolExecutor() as executor:
-            results = list(executor.map(PDFPipeline.preprocess_text, sentences))
-        return [r for r in results if r is not None]
+            processed = list(executor.map(PDFPipeline.preprocess_text, sentences))
+        return [p for p in processed if p]
 
-    ##########################################################################
-    # PROCESSING PIPELINE
-    ##########################################################################
-    def process_pdf(self, dataset_id, pdf_path, writer):
-        """
-        1) Extract text
-        2) Split into sentences
-        3) Parallel-preprocess
-        4) Classify cause vs. non-cause
-        5) Write causal sentences to CSV
-        """
-        document_id = os.path.basename(pdf_path)
-        text = self.extract_pdf_text(pdf_path)
-        sentences = self.split_into_sentences(text)
+    def process_pdf(self, dataset_id: str, pdf_path: str, writer: csv.writer) -> None:
+        doc_id = os.path.basename(pdf_path)
+        raw_text = self.extract_pdf_text(pdf_path)
+        sentences = self.split_into_sentences(raw_text)
         preprocessed = self.preprocess_sentences_parallel(sentences)
+        causal_sents = self.ssc_model.classify_sentences(preprocessed)
 
-        # Use SSCBertModel to classify
-        causal_sentences = self.ssc_model.classify_sentences(preprocessed)
-
-        for sentence in causal_sentences:
-            # Safely encode to avoid weird chars in CSV
-            sentence = sentence.encode('utf-8', 'replace').decode('utf-8')
-            writer.writerow([dataset_id, document_id, sentence])
+        for sent in causal_sents:
+            sent = sent.encode('utf-8', 'replace').decode('utf-8')
+            writer.writerow([dataset_id, doc_id, sent])
 
 
-##############################################################################
-# MAIN
-##############################################################################
 def main():
     input_folders = [
         "/data (pre-processing)/ThirdDataset_PDF",
         "/data (pre-processing)/Xavier_PDF",
         "/data (pre-processing)/ThirdDataset_PDF"
     ]
-    output_folder = "/content/drive/MyDrive/processed_csv_causal"
+    output_folder = "annotation_folder/causal_sentences.csv"
     os.makedirs(output_folder, exist_ok=True)
 
     output_csv = os.path.join(output_folder, "causal_sentences.csv")
-
-    # Instantiate the model
     ssc_model = SSCBertModel()
-    # Instantiate pipeline
-    pipeline_processor = PDFPipeline(ssc_model=ssc_model)
+    pdf_processor = PDFPipeline(ssc_model=ssc_model)
 
-    with open(output_csv, mode='w', newline='', encoding='utf-8-sig') as file:
-        writer = csv.writer(file)
+    with open(output_csv, 'w', newline='', encoding='utf-8-sig') as fout:
+        writer = csv.writer(fout)
         writer.writerow(["dataset_id", "document_id", "causal_sentence"])
 
         for folder in input_folders:
@@ -189,10 +132,9 @@ def main():
             for pdf_file in os.listdir(folder):
                 if pdf_file.endswith(".pdf"):
                     pdf_path = os.path.join(folder, pdf_file)
-                    pipeline_processor.process_pdf(dataset_id, pdf_path, writer)
+                    pdf_processor.process_pdf(dataset_id, pdf_path, writer)
 
-    print("Pipeline execution completed. Check the 'processed_csv_causal' directory for results.")
-
+    print("Pipeline execution completed. Check results in 'processed_csv_causal'.")
 
 if __name__ == "__main__":
     main()
